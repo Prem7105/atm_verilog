@@ -1,0 +1,64 @@
+// Debounce Module - FIXED
+// Generates a single-clock-cycle pulse on btn_out each time btn_in
+// has a stable rising edge for DEBOUNCE_LIMIT consecutive cycles.
+//
+// FIXES vs original:
+//   1. Counter now counts while btn_in == 1 (not while it differs from stable).
+//      This matches how the TB drives key_valid: goes high, stays high for N
+//      cycles, then goes low.  The old logic waited for btn_in != stable which
+//      meant after stable went high the counter immediately reset.
+//   2. One-shot: after firing, waits for btn_in to go low before arming again
+//      (prevents multiple pulses on a long press).
+//   3. `timescale added (was missing, causing simulator warnings).
+`timescale 1ns / 1ps
+
+module debounce (
+    input  clk,
+    input  reset,
+    input  btn_in,
+    output btn_out
+);
+    parameter DEBOUNCE_LIMIT = 20'd999_999;  // ~20 ms @ 50 MHz; TB overrides to 5
+
+    reg [19:0] cnt;
+    reg        stable;
+    reg        prev;
+    reg        armed;    // prevents re-fire while btn still held
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            cnt    <= 0;
+            stable <= 0;
+            prev   <= 0;
+            armed  <= 1;
+        end else begin
+            prev <= stable;
+
+            if (!armed) begin
+                // Wait for button to be released before accepting next press
+                if (!btn_in) begin
+                    armed  <= 1;
+                    cnt    <= 0;
+                    stable <= 0;
+                end
+            end else begin
+                if (btn_in) begin
+                    if (cnt >= DEBOUNCE_LIMIT) begin
+                        stable <= 1;
+                        armed  <= 0;   // one-shot fired, wait for release
+                        cnt    <= 0;
+                    end else begin
+                        cnt <= cnt + 1;
+                    end
+                end else begin
+                    cnt    <= 0;
+                    stable <= 0;
+                end
+            end
+        end
+    end
+
+    // Rising-edge pulse: one clock wide
+    assign btn_out = stable & ~prev;
+
+endmodule

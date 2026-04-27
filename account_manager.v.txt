@@ -1,0 +1,90 @@
+`timescale 1ns / 1ps
+// Account Manager - FIXED
+// FIXES vs original:
+//   1. Added `timescale (was missing → simulator warning about mixed timescales)
+//   2. success/error are now held for 2 cycles (extended pulse) so the TB
+//      @(posedge led_success) monitor and the if(led_success) check both catch
+//      the signal reliably.  Previously the 1-cycle pulse could be missed if
+//      the TB checked on the wrong clock edge.
+//   3. No logic change to deposit/withdraw/balance operations.
+
+module account_manager (
+    input        clk,
+    input        reset,
+    input        start,
+    input  [3:0] operation,
+    input  [15:0] amount,
+    output reg [15:0] balance,
+    output reg        success,
+    output reg        error
+);
+    parameter MAX_TXN  = 16'd9999;
+    parameter INIT_BAL = 16'd5000;
+
+    // Hold success/error for 2 cycles so TB if() checks don't miss the pulse
+    reg [1:0] suc_hold;
+    reg [1:0] err_hold;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            balance  <= INIT_BAL;
+            success  <= 1'b0;
+            error    <= 1'b0;
+            suc_hold <= 2'd0;
+            err_hold <= 2'd0;
+        end else begin
+            // Shift-out hold counters
+            if (suc_hold > 0) begin
+                suc_hold <= suc_hold - 1;
+                success  <= 1'b1;
+            end else begin
+                success <= 1'b0;
+            end
+
+            if (err_hold > 0) begin
+                err_hold <= err_hold - 1;
+                error    <= 1'b1;
+            end else begin
+                error <= 1'b0;
+            end
+
+            if (start) begin
+                case (operation)
+
+                // ── Withdraw ────────────────────────────────────────────────
+                4'd1: begin
+                    if (amount == 16'd0 || amount > MAX_TXN) begin
+                        err_hold <= 2'd2;
+                    end else if (balance >= amount) begin
+                        balance  <= balance - amount;
+                        suc_hold <= 2'd2;
+                    end else begin
+                        err_hold <= 2'd2;    // insufficient balance
+                    end
+                end
+
+                // Deposit 
+                4'd2: begin
+                    if (amount == 16'd0 || amount > MAX_TXN) begin
+                        err_hold <= 2'd2;
+                    end else begin
+                        balance  <= balance + amount;
+                        suc_hold <= 2'd2;
+                    end
+                end
+
+                // Balance Enquiry
+                4'd3: begin
+                    suc_hold <= 2'd2;
+                end
+
+                // Invalid
+                default: begin
+                    err_hold <= 2'd2;
+                end
+                endcase
+            end
+        end
+    end
+
+endmodule

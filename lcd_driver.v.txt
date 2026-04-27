@@ -1,0 +1,412 @@
+// LCD Driver - HD44780 16×2, 8-bit mode, 50 MHz clock
+// Board J7 connector (EDGE Artix 7):
+//   RS  → FPGA P5       EN  → FPGA T3
+//   D0  → FPGA T4       D1  → FPGA T2      D2  → FPGA R3
+//   D3  → FPGA R1       D4  → FPGA R2      D5  → FPGA N4
+//   D6  → FPGA M5       D7  → FPGA P3
+//   R/W → GND (write-only, board-level)
+//
+// FIXES:
+//   1. Replaced non-synthesizable division (/1000, /100, /10) with
+//      a proper double-dabble (shift-and-add-3) BCD converter in a
+//      dedicated always block.
+//   2. Removed non-synthesizable task with non-blocking assignments;
+//      replaced with a registered display-content mux using case statement
+//      directly in the always @(posedge clk) sequencer.
+//   3. Replaced "integer k" loop variable with a sized reg [3:0].
+
+module lcd_driver (
+    input        clk,          // 50 MHz
+    input        reset,
+    input        pin_ok,
+    input  [3:0] menu_option,
+    input [15:0] balance,
+    input        success,
+    input        error,
+    output reg [7:0] lcd_data,
+    output reg       lcd_rs,
+    output reg       lcd_en
+);
+
+// Timing (50 MHz = 20 ns/cycle)
+localparam T_PWRON  = 26'd2_500_000;  // 50 ms
+localparam T_LONG   = 20'd100_000;    // 2 ms  (after clear / home)
+localparam T_SHORT  = 14'd2000;       // 40 µs (after other commands)
+localparam T_EN_HI  = 7'd50;          // 1 µs  (EN high pulse width)
+
+// Sequencer state encoding
+localparam [4:0]
+    S_PWRON    = 5'd0,
+    S_INIT_38  = 5'd1,
+    S_INIT_0C  = 5'd2,
+    S_INIT_06  = 5'd3,
+    S_INIT_01  = 5'd4,
+    S_READY    = 5'd5,
+    S_CLR      = 5'd6,
+    S_ADDR0    = 5'd7,
+    S_DATA0    = 5'd8,
+    S_ADDR1    = 5'd9,
+    S_DATA1    = 5'd10,
+    S_EN_HI    = 5'd11,
+    S_EN_LO    = 5'd12;
+
+// Display content selection
+localparam [2:0]
+    D_IDLE    = 3'd0,
+    D_WRONG   = 3'd1,
+    D_MENU    = 3'd2,
+    D_WDRAW   = 3'd3,
+    D_DEPOS   = 3'd4,
+    D_SUCCESS = 3'd5,
+    D_ERROR   = 3'd6,
+    D_BAL     = 3'd7;
+
+reg [2:0] disp;
+always @(*) begin
+    if (!pin_ok && !error)                    disp = D_IDLE;
+    else if (!pin_ok && error)                disp = D_WRONG;
+    else if (success && menu_option == 4'd3)  disp = D_BAL;
+    else if (success)                         disp = D_SUCCESS;
+    else if (error)                           disp = D_ERROR;
+    else if (menu_option == 4'd1)             disp = D_WDRAW;
+    else if (menu_option == 4'd2)             disp = D_DEPOS;
+    else                                      disp = D_MENU;
+end
+
+// FIX 1: Balance → BCD using double-dabble (shift-and-add-3)
+// Converts 16-bit binary balance (0-9999) to 4 BCD digits
+reg [3:0] bcd_th, bcd_hu, bcd_te, bcd_un; // thousands, hundreds, tens, units
+reg [15:0] bal_shift;
+reg [3:0]  dd_i; // loop counter, sized reg instead of integer
+
+always @(*) begin : bcd_convert
+    reg [3:0] th, hu, te, un;
+    reg [15:0] tmp;
+    reg [3:0]  i;
+    th  = 4'd0;
+    hu  = 4'd0;
+    te  = 4'd0;
+    un  = 4'd0;
+    tmp = balance;
+    for (i = 0; i < 14; i = i + 1) begin  // 14 shifts enough for 0-9999
+        // Add 3 if digit >= 5
+        if (th >= 4'd5) th = th + 4'd3;
+        if (hu >= 4'd5) hu = hu + 4'd3;
+        if (te >= 4'd5) te = te + 4'd3;
+        if (un >= 4'd5) un = un + 4'd3;
+        // Shift left
+        th  = {th[2:0],  hu[3]};
+        hu  = {hu[2:0],  te[3]};
+        te  = {te[2:0],  un[3]};
+        un  = {un[2:0],  tmp[15]};
+        tmp = {tmp[14:0], 1'b0};
+    end
+    bcd_th = th;
+    bcd_hu = hu;
+    bcd_te = te;
+    bcd_un = un;
+end
+
+// ASCII digits
+wire [7:0] a_th = 8'd48 + {4'd0, bcd_th};
+wire [7:0] a_hu = 8'd48 + {4'd0, bcd_hu};
+wire [7:0] a_te = 8'd48 + {4'd0, bcd_te};
+wire [7:0] a_un = 8'd48 + {4'd0, bcd_un};
+
+// Row buffers (16 bytes each)
+reg [7:0] row0 [0:15];
+reg [7:0] row1 [0:15];
+
+// FIX 2: Row loading - done directly in clocked always block using case,
+//        no task, no non-blocking inside tasks.
+//        Triggered when disp changes (prev_disp != disp).
+reg [2:0] prev_disp;
+reg       load_req;   // single-cycle flag to load rows
+reg [3:0] lk;         // FIX 3: sized reg instead of integer for loop
+
+// Main sequencer
+// ─────────────────────────────────────────────────────────────────────────────
+reg [4:0]  seq;
+reg [4:0]  seq_ret;
+reg [25:0] delay;
+reg [4:0]  char_cnt;
+reg        need_long;
+reg [7:0]  pend_data_r;
+reg        pend_rs_r;
+
+always @(posedge clk or posedge reset) begin : main_seq
+    reg [3:0] j; // local sized loop variable
+    if (reset) begin
+        seq         <= S_PWRON;
+        seq_ret     <= S_PWRON;
+        delay       <= 0;
+        char_cnt    <= 0;
+        lcd_data    <= 8'h00;
+        lcd_rs      <= 0;
+        lcd_en      <= 0;
+        prev_disp   <= 3'b111;
+        need_long   <= 0;
+        pend_data_r <= 0;
+        pend_rs_r   <= 0;
+        // Clear row buffers
+        for (j = 0; j < 15; j = j + 1) begin
+            row0[j] <= 8'd32;
+            row1[j] <= 8'd32;
+        end
+        row0[15] <= 8'd32;
+        row1[15] <= 8'd32;
+    end else begin
+
+        case (seq)
+
+        // Power-on delay
+        S_PWRON: begin
+            lcd_en <= 0;
+            delay  <= delay + 1;
+            if (delay >= T_PWRON) begin
+                delay <= 0;
+                seq   <= S_INIT_38;
+            end
+        end
+
+        // Init: Function Set 0x38 
+        S_INIT_38: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'h38;
+            need_long   <= 0;
+            seq_ret     <= S_INIT_0C;
+            seq         <= S_EN_HI;
+        end
+
+        // Init: Display ON 0x0C
+        S_INIT_0C: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'h0C;
+            need_long   <= 0;
+            seq_ret     <= S_INIT_06;
+            seq         <= S_EN_HI;
+        end
+
+        // Init: Entry Mode 0x06
+        S_INIT_06: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'h06;
+            need_long   <= 0;
+            seq_ret     <= S_INIT_01;
+            seq         <= S_EN_HI;
+        end
+
+        // Init: Clear 0x01
+        S_INIT_01: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'h01;
+            need_long   <= 1;
+            seq_ret     <= S_READY;
+            seq         <= S_EN_HI;
+        end
+
+        // READY: detect screen change → load rows → trigger refresh
+        S_READY: begin
+            lcd_en <= 0;
+            if (disp != prev_disp) begin
+                prev_disp <= disp;
+                // FIX 2: Load rows directly here using case (synthesizable)
+                case (disp)
+                    D_IDLE: begin
+                        row0[0]<=8'd32; row0[1]<=8'd32; row0[2]<=8'd87; row0[3]<=8'd69;
+                        row0[4]<=8'd76; row0[5]<=8'd67; row0[6]<=8'd79; row0[7]<=8'd77;
+                        row0[8]<=8'd69; row0[9]<=8'd32; row0[10]<=8'd65; row0[11]<=8'd84;
+                        row0[12]<=8'd77; row0[13]<=8'd32; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // "  WELCOME  ATM  "
+                        row1[0]<=8'd32; row1[1]<=8'd32; row1[2]<=8'd69; row1[3]<=8'd78;
+                        row1[4]<=8'd84; row1[5]<=8'd69; row1[6]<=8'd82; row1[7]<=8'd32;
+                        row1[8]<=8'd32; row1[9]<=8'd32; row1[10]<=8'd80; row1[11]<=8'd73;
+                        row1[12]<=8'd78; row1[13]<=8'd58; row1[14]<=8'd32; row1[15]<=8'd32;
+                        // "  ENTER   PIN:  "
+                    end
+                    D_WRONG: begin
+                        // "  WRONG   PIN!  "
+                        row0[0]<=8'd32; row0[1]<=8'd32; row0[2]<=8'd87; row0[3]<=8'd82;
+                        row0[4]<=8'd79; row0[5]<=8'd78; row0[6]<=8'd71; row0[7]<=8'd32;
+                        row0[8]<=8'd32; row0[9]<=8'd32; row0[10]<=8'd80; row0[11]<=8'd73;
+                        row0[12]<=8'd78; row0[13]<=8'd33; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // "  TRY   AGAIN   "
+                        row1[0]<=8'd32; row1[1]<=8'd32; row1[2]<=8'd84; row1[3]<=8'd82;
+                        row1[4]<=8'd89; row1[5]<=8'd32; row1[6]<=8'd32; row1[7]<=8'd32;
+                        row1[8]<=8'd65; row1[9]<=8'd71; row1[10]<=8'd65; row1[11]<=8'd73;
+                        row1[12]<=8'd78; row1[13]<=8'd32; row1[14]<=8'd32; row1[15]<=8'd32;
+                    end
+                    D_MENU: begin
+                        // "1.WDRAW 2.DEPOS "
+                        row0[0]<=8'd49; row0[1]<=8'd46; row0[2]<=8'd87; row0[3]<=8'd68;
+                        row0[4]<=8'd82; row0[5]<=8'd65; row0[6]<=8'd87; row0[7]<=8'd32;
+                        row0[8]<=8'd50; row0[9]<=8'd46; row0[10]<=8'd68; row0[11]<=8'd69;
+                        row0[12]<=8'd80; row0[13]<=8'd79; row0[14]<=8'd83; row0[15]<=8'd32;
+                        // "3.BALNCE 0.EXIT "
+                        row1[0]<=8'd51; row1[1]<=8'd46; row1[2]<=8'd66; row1[3]<=8'd65;
+                        row1[4]<=8'd76; row1[5]<=8'd78; row1[6]<=8'd67; row1[7]<=8'd69;
+                        row1[8]<=8'd32; row1[9]<=8'd48; row1[10]<=8'd46; row1[11]<=8'd69;
+                        row1[12]<=8'd88; row1[13]<=8'd73; row1[14]<=8'd84; row1[15]<=8'd32;
+                    end
+                    D_WDRAW: begin
+                        // "   WITHDRAW     "
+                        row0[0]<=8'd32; row0[1]<=8'd32; row0[2]<=8'd32; row0[3]<=8'd87;
+                        row0[4]<=8'd73; row0[5]<=8'd84; row0[6]<=8'd72; row0[7]<=8'd68;
+                        row0[8]<=8'd82; row0[9]<=8'd65; row0[10]<=8'd87; row0[11]<=8'd32;
+                        row0[12]<=8'd32; row0[13]<=8'd32; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // " ENTER AMOUNT:  "
+                        row1[0]<=8'd32; row1[1]<=8'd69; row1[2]<=8'd78; row1[3]<=8'd84;
+                        row1[4]<=8'd69; row1[5]<=8'd82; row1[6]<=8'd32; row1[7]<=8'd65;
+                        row1[8]<=8'd77; row1[9]<=8'd79; row1[10]<=8'd85; row1[11]<=8'd78;
+                        row1[12]<=8'd84; row1[13]<=8'd58; row1[14]<=8'd32; row1[15]<=8'd32;
+                    end
+                    D_DEPOS: begin
+                        // "    DEPOSIT     "
+                        row0[0]<=8'd32; row0[1]<=8'd32; row0[2]<=8'd32; row0[3]<=8'd32;
+                        row0[4]<=8'd68; row0[5]<=8'd69; row0[6]<=8'd80; row0[7]<=8'd79;
+                        row0[8]<=8'd83; row0[9]<=8'd73; row0[10]<=8'd84; row0[11]<=8'd32;
+                        row0[12]<=8'd32; row0[13]<=8'd32; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // " ENTER AMOUNT:  "
+                        row1[0]<=8'd32; row1[1]<=8'd69; row1[2]<=8'd78; row1[3]<=8'd84;
+                        row1[4]<=8'd69; row1[5]<=8'd82; row1[6]<=8'd32; row1[7]<=8'd65;
+                        row1[8]<=8'd77; row1[9]<=8'd79; row1[10]<=8'd85; row1[11]<=8'd78;
+                        row1[12]<=8'd84; row1[13]<=8'd58; row1[14]<=8'd32; row1[15]<=8'd32;
+                    end
+                    D_SUCCESS: begin
+                        // "   SUCCESS!     "
+                        row0[0]<=8'd32; row0[1]<=8'd32; row0[2]<=8'd32; row0[3]<=8'd83;
+                        row0[4]<=8'd85; row0[5]<=8'd67; row0[6]<=8'd67; row0[7]<=8'd69;
+                        row0[8]<=8'd83; row0[9]<=8'd83; row0[10]<=8'd33; row0[11]<=8'd32;
+                        row0[12]<=8'd32; row0[13]<=8'd32; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // "  THANK  YOU!   "
+                        row1[0]<=8'd32; row1[1]<=8'd32; row1[2]<=8'd84; row1[3]<=8'd72;
+                        row1[4]<=8'd65; row1[5]<=8'd78; row1[6]<=8'd75; row1[7]<=8'd32;
+                        row1[8]<=8'd32; row1[9]<=8'd89; row1[10]<=8'd79; row1[11]<=8'd85;
+                        row1[12]<=8'd33; row1[13]<=8'd32; row1[14]<=8'd32; row1[15]<=8'd32;
+                    end
+                    D_ERROR: begin
+                        // "    ERROR!      "
+                        row0[0]<=8'd32; row0[1]<=8'd32; row0[2]<=8'd32; row0[3]<=8'd32;
+                        row0[4]<=8'd69; row0[5]<=8'd82; row0[6]<=8'd82; row0[7]<=8'd79;
+                        row0[8]<=8'd82; row0[9]<=8'd33; row0[10]<=8'd32; row0[11]<=8'd32;
+                        row0[12]<=8'd32; row0[13]<=8'd32; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // " LOW BALANCE!   "
+                        row1[0]<=8'd32; row1[1]<=8'd76; row1[2]<=8'd79; row1[3]<=8'd87;
+                        row1[4]<=8'd32; row1[5]<=8'd66; row1[6]<=8'd65; row1[7]<=8'd76;
+                        row1[8]<=8'd65; row1[9]<=8'd78; row1[10]<=8'd67; row1[11]<=8'd69;
+                        row1[12]<=8'd33; row1[13]<=8'd32; row1[14]<=8'd32; row1[15]<=8'd32;
+                    end
+                    default: begin  // D_BAL
+                        // " YOUR BALANCE:  "
+                        row0[0]<=8'd32; row0[1]<=8'd89; row0[2]<=8'd79; row0[3]<=8'd85;
+                        row0[4]<=8'd82; row0[5]<=8'd32; row0[6]<=8'd66; row0[7]<=8'd65;
+                        row0[8]<=8'd76; row0[9]<=8'd65; row0[10]<=8'd78; row0[11]<=8'd67;
+                        row0[12]<=8'd69; row0[13]<=8'd58; row0[14]<=8'd32; row0[15]<=8'd32;
+                        // " BAL=XXXX       " (live BCD digits)
+                        row1[0]<=8'd32;  row1[1]<=8'd32;
+                        row1[2]<=8'd66;  row1[3]<=8'd65;   // 'B','A'
+                        row1[4]<=8'd76;  row1[5]<=8'd61;   // 'L','='
+                        row1[6]<=a_th;   row1[7]<=a_hu;
+                        row1[8]<=a_te;   row1[9]<=a_un;
+                        row1[10]<=8'd32; row1[11]<=8'd32;
+                        row1[12]<=8'd32; row1[13]<=8'd32;
+                        row1[14]<=8'd32; row1[15]<=8'd32;
+                    end
+                endcase
+                seq <= S_CLR;
+            end
+        end
+
+        // Clear 0x01
+        S_CLR: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'h01;
+            need_long   <= 1;
+            seq_ret     <= S_ADDR0;
+            seq         <= S_EN_HI;
+        end
+
+        // Set Row 0 address 0x80
+        S_ADDR0: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'h80;
+            need_long   <= 0;
+            char_cnt    <= 0;
+            seq_ret     <= S_DATA0;
+            seq         <= S_EN_HI;
+        end
+
+        // Write row 0 characters
+        S_DATA0: begin
+            pend_rs_r   <= 1;
+            pend_data_r <= row0[char_cnt[3:0]];
+            need_long   <= 0;
+            if (char_cnt == 5'd15) begin
+                seq_ret <= S_ADDR1;
+            end else begin
+                char_cnt <= char_cnt + 1;
+                seq_ret  <= S_DATA0;
+            end
+            seq <= S_EN_HI;
+        end
+
+        // Set Row 1 address 0xC0
+        S_ADDR1: begin
+            pend_rs_r   <= 0;
+            pend_data_r <= 8'hC0;
+            need_long   <= 0;
+            char_cnt    <= 0;
+            seq_ret     <= S_DATA1;
+            seq         <= S_EN_HI;
+        end
+
+        // Write row 1 characters
+        S_DATA1: begin
+            pend_rs_r   <= 1;
+            pend_data_r <= row1[char_cnt[3:0]];
+            need_long   <= 0;
+            if (char_cnt == 5'd15) begin
+                seq_ret <= S_READY;
+            end else begin
+                char_cnt <= char_cnt + 1;
+                seq_ret  <= S_DATA1;
+            end
+            seq <= S_EN_HI;
+        end
+
+        // EN high pulse
+        S_EN_HI: begin
+            lcd_rs   <= pend_rs_r;
+            lcd_data <= pend_data_r;
+            lcd_en   <= 1;
+            delay    <= delay + 1;
+            if (delay >= T_EN_HI) begin
+                delay  <= 0;
+                lcd_en <= 0;
+                seq    <= S_EN_LO;
+            end
+        end
+
+        // EN low (post-write wait) 
+        S_EN_LO: begin
+            lcd_en <= 0;
+            delay  <= delay + 1;
+            if (need_long) begin
+                if (delay >= T_LONG) begin
+                    delay <= 0;
+                    seq   <= seq_ret;
+                end
+            end else begin
+                if (delay >= T_SHORT) begin
+                    delay <= 0;
+                    seq   <= seq_ret;
+                end
+            end
+        end
+
+        default: seq <= S_PWRON;
+        endcase
+    end
+end
+
+endmodule

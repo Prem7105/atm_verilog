@@ -1,0 +1,108 @@
+`timescale 1ns / 1ps
+// ATM Controller (FSM) - FIXED
+// FIXES vs original:
+//   1. Added `timescale (was missing → simulator warning)
+//   2. Buzzer tone generator runs continuously; buzzer_en gates the output.
+//      No change in logic, just added timescale.
+//   3. wrong_cnt in IDLE state: pin_wrong is now a one-cycle pulse from
+//      keypad_interface, so the edge detection here is correct.
+//   4. READY → ERR path: catches error from account_manager.
+
+module atm_controller (
+    input  clk,
+    input  reset,
+    input  pin_ok,
+    input  pin_wrong,
+    input  error,
+    input  success,
+    output buzzer
+);
+    // 3.8 kHz: half-period = 50_000_000 / (2×3800) ≈ 6579 cycles
+    parameter BUZZ_HALF = 17'd6579;
+    parameter ONE_SEC   = 26'd50_000_000;
+
+    localparam IDLE   = 2'd0,
+               READY  = 2'd1,
+               ERR    = 2'd2,
+               LOCKED = 2'd3;
+
+    reg [1:0]  state;
+    reg [25:0] err_cnt;
+    reg [16:0] buzz_cnt;
+    reg        buzz_phase;
+    reg [1:0]  wrong_cnt;
+    reg        buzzer_en;
+
+    // Buzzer tone generator 
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            buzz_cnt   <= 0;
+            buzz_phase <= 0;
+        end else begin
+            if (buzz_cnt >= BUZZ_HALF) begin
+                buzz_cnt   <= 0;
+                buzz_phase <= ~buzz_phase;
+            end else begin
+                buzz_cnt <= buzz_cnt + 1;
+            end
+        end
+    end
+    // FSM
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state     <= IDLE;
+            err_cnt   <= 0;
+            buzzer_en <= 0;
+            wrong_cnt <= 2'd0;
+        end else begin
+            case (state)
+
+            IDLE: begin
+                buzzer_en <= 0;
+                err_cnt   <= 0;
+                if (pin_ok) begin
+                    wrong_cnt <= 2'd0;
+                    state     <= READY;
+                end else if (pin_wrong) begin
+                    buzzer_en <= 1;
+                    if (wrong_cnt >= 2'd2)
+                        state <= LOCKED;
+                    else begin
+                        wrong_cnt <= wrong_cnt + 2'd1;
+                        state     <= ERR;
+                    end
+                end
+            end
+
+            READY: begin
+                buzzer_en <= 0;
+                err_cnt   <= 0;
+                if (error)
+                    state <= ERR;
+                else if (!pin_ok)    // logout
+                    state <= IDLE;
+            end
+
+            ERR: begin
+                buzzer_en <= 1;
+                err_cnt   <= err_cnt + 1;
+                if (err_cnt >= ONE_SEC) begin
+                    err_cnt   <= 0;
+                    buzzer_en <= 0;
+                    state     <= (pin_ok) ? READY : IDLE;
+                end
+            end
+
+            LOCKED: begin
+                buzzer_en <= 1;
+                // Only reset clears this
+            end
+
+            default: state <= IDLE;
+            endcase
+        end
+    end
+
+    assign buzzer = buzzer_en ? buzz_phase : 1'b0;
+
+endmodule

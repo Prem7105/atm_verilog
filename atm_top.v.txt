@@ -1,0 +1,110 @@
+// ATM Top Module - EDGE Artix 7 FPGA (XC7A35T)
+// Board: EDGE Artix 7 (allaboutfpga.com)
+// Clock: 50 MHz on-board oscillator (pin N11)
+// PIN MAPPING (from XDC):
+//   clk         → N11   (50 MHz on-board oscillator)
+//   reset       → pb[0] → K13 (push button top - active HIGH after pull-down)
+//   key_valid   → pb[1] → L14 (push button bottom - pressed to validate keypad key)
+//   keypad_in   → sw[3:0] → M2,M4,L4,L5  (slide switches for hex keypad emulation)
+//   lcd_data    → data[7:0] (J7 LCD connector: T4,T2,R3,R1,R2,N4,M5,P3)
+//   lcd_rs      → lcd_rs → P5
+//   lcd_en      → lcd_e  → T3
+//   buzzer      → Buzzer → K12
+//   led[0]      → J3  (PIN OK indicator)
+//   led[1]      → H3  (ERROR indicator)
+//   led[2]      → J1  (SUCCESS indicator)
+//   led[3]      → K1  (TRANSACTION ACTIVE indicator)
+
+`timescale 1ns / 1ps
+
+module atm_top (
+    input        clk,          // 50 MHz - N11
+    input        reset,        // pb[0]  - K13 (active HIGH after PULLDOWN)
+    input  [3:0] keypad_in,    // sw[3:0] - M2,M4,L4,L5
+    input        key_valid,    // pb[1]  - L14 (press to latch current keypad value)
+    output       buzzer,       // K12
+    output [7:0] lcd_data,     // data[7:0] - T4,T2,R3,R1,R2,N4,M5,P3  (D0..D7)
+    output       lcd_rs,       // P5
+    output       lcd_en,       // T3
+    output       led_pin_ok,   // J3  - led[0]
+    output       led_error,    // H3  - led[1]
+    output       led_success,  // J1  - led[2]
+    output       led_txn       // K1  - led[3]
+);
+
+// Internal wires connecting sub-modules
+wire        pin_ok;
+wire        pin_wrong;
+wire [3:0]  menu_option;
+wire [15:0] amount;
+wire [15:0] balance;
+wire        success;
+wire        error;
+wire        start_txn;
+wire        key_valid_db;   // debounced key_valid pulse
+
+// Debounce key_valid button
+debounce DB (
+    .clk     (clk),
+    .reset   (reset),
+    .btn_in  (key_valid),
+    .btn_out (key_valid_db)
+);
+
+// Keypad Interface  (PIN entry → menu selection → amount entry)
+keypad_interface KI (
+    .clk        (clk),
+    .reset      (reset),
+    .keypad_in  (keypad_in),
+    .key_valid  (key_valid_db),
+    .pin_ok     (pin_ok),
+    .pin_wrong  (pin_wrong),
+    .menu_option(menu_option),
+    .amount     (amount),
+    .start_txn  (start_txn)
+);
+
+// Account Manager  (balance register, deposit / withdraw logic)
+account_manager AM (
+    .clk      (clk),
+    .reset    (reset),
+    .start    (start_txn),
+    .operation(menu_option),
+    .amount   (amount),
+    .balance  (balance),
+    .success  (success),
+    .error    (error)
+);
+
+// ATM Controller FSM  (buzzer, LED status)
+atm_controller CTRL (
+    .clk      (clk),
+    .reset    (reset),
+    .pin_ok   (pin_ok),
+    .pin_wrong(pin_wrong),
+    .error    (error),
+    .success  (success),
+    .buzzer   (buzzer)
+);
+
+// LCD Driver  (16×2 HD44780 - 8-bit mode, board connector J7)
+lcd_driver LCD (
+    .clk        (clk),
+    .reset      (reset),
+    .pin_ok     (pin_ok),
+    .menu_option(menu_option),
+    .balance    (balance),
+    .success    (success),
+    .error      (error),
+    .lcd_data   (lcd_data),
+    .lcd_rs     (lcd_rs),
+    .lcd_en     (lcd_en)
+);
+
+// LED indicators
+assign led_pin_ok  = pin_ok;
+assign led_error   = error;
+assign led_success = success;
+assign led_txn     = start_txn;
+
+endmodule
