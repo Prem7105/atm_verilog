@@ -1,7 +1,4 @@
-Here is a clean, professional, and concise **README.md** without fluff or emojis:
-
-
-# FPGA-Based ATM System (Verilog)
+ FPGA-Based ATM System (Verilog)
 
 ## Overview
 
@@ -19,7 +16,6 @@ The design focuses on digital system implementation using a Finite State Machine
 * Keypad-based user input
 * FSM-based control logic
 
----
 
 ## System Design
 
@@ -36,7 +32,6 @@ The system is structured around a Finite State Machine with the following states
 
 Each state handles a specific part of the ATM workflow, ensuring a clear and modular design.
 
----
 
 ## Hardware Requirements
 
@@ -45,7 +40,6 @@ Each state handles a specific part of the ATM workflow, ensuring a clear and mod
 * 16×2 LCD display
 * Power supply
 
----
 
 ## Software and Tools
 
@@ -59,13 +53,11 @@ Each state handles a specific part of the ATM workflow, ensuring a clear and mod
 
 The user interacts with the system through a keypad to enter a PIN. The system verifies the PIN and, upon successful authentication, allows the user to select a transaction type. For deposits, the entered amount is added to the stored balance. For withdrawals, the system checks for sufficient balance before processing the transaction. All instructions and outputs are displayed on the LCD.
 
----
 
 ## Simulation
 
 Simulation verifies correct FSM transitions, PIN validation, and transaction handling. Testbenches are used to validate different operational scenarios including invalid PIN attempts and insufficient balance conditions.
 
----
 
 ## Future Improvements
 
@@ -74,10 +66,4 @@ Simulation verifies correct FSM transitions, PIN validation, and transaction han
 * Enhanced security mechanisms
 * Integration with external systems
 
----
 
-## License
-
-This project is released under the MIT License.
-
----
