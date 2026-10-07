@@ -1,59 +1,66 @@
-# FPGA-Based ATM System (Verilog)
+# FPGA ATM Controller (Verilog)
 
-## Overview
-
-This project implements a simplified Automated Teller Machine (ATM) on an FPGA using Verilog HDL. The system supports basic banking operations including user authentication, cash deposit, and cash withdrawal. It integrates hardware components such as a matrix keypad for input and a 16×2 LCD for output display.
-
-The design focuses on digital system implementation using a Finite State Machine (FSM) and demonstrates real-time interaction between user inputs and hardware-controlled outputs.
+A modular Verilog implementation of a simplified ATM workflow for FPGA practice. It demonstrates PIN entry, authentication, menu selection, deposits, withdrawals, balance updates, and LCD feedback using a keypad-driven finite-state machine.
 
 ## Features
 
-- PIN-based user authentication
-- Deposit functionality with balance update
-- Withdrawal functionality with balance verification
-- Real-time display using 16×2 LCD
-- Keypad-based user input
-- FSM-based control logic
+- PIN-based authentication and transaction flow.
+- Deposit and withdrawal handling with balance checks.
+- Matrix keypad input with input conditioning/debounce.
+- 16×2 LCD controller for prompts and results.
+- Account state separated from transaction sequencing.
+- Testbench covering controller and transaction behavior.
 
-## System Design
+## Architecture
 
-The system is structured around a Finite State Machine with the following states:
+```mermaid
+flowchart LR
+  K[Keypad] --> I[keypad_interface]
+  I --> C[atm_controller]
+  C --> A[account_manager]
+  C --> L[lcd_driver]
+  C --> O[FPGA outputs]
+  T[atm_tb] -. verifies .-> C
+```
 
-- Idle
-- PIN Entry
-- Authentication
-- Menu Selection
-- Deposit
-- Withdrawal
-- Transaction Processing
-- Display Output
+| Module | Responsibility |
+| --- | --- |
+| `atm_top.v` | Top-level wiring and board-facing signals |
+| `keypad_interface.v` | Keypad scanning/decoding and user-input events |
+| `debounce.v` | Filters unstable button/key signals |
+| `atm_controller.v` | FSM for login, menu, and transaction flow |
+| `account_manager.v` | PIN/account state and balance operations |
+| `lcd_driver.v` | LCD initialization and character output |
+| `atm_tb.v` | Simulation testbench |
 
-Each state handles a specific part of the ATM workflow, ensuring a clear and modular design.
+## Workflow
 
-## Hardware Requirements
+The controller waits for user input, collects a PIN, checks authentication, and then accepts a transaction choice. Deposit amounts update the balance; withdrawals are accepted only when funds are sufficient. The LCD reports prompts and outcomes. Exact PIN, reset behavior, clock timing, and board pin mapping should be confirmed in the HDL and the target board constraints before hardware use.
 
-- FPGA board (e.g., Basys 3, Spartan-6, Artix-7)
-- 4×4 matrix keypad
-- 16×2 LCD display
-- Power supply
-
-## Software and Tools
+## Tools and hardware
 
 - Verilog HDL
-- Xilinx Vivado or ISE
-- ModelSim (optional, for simulation)
+- Xilinx Vivado (the project context uses an Artix-7 FPGA board; adapt constraints for your board)
+- Optional HDL simulator such as Vivado Simulator or ModelSim
+- 4×4 keypad and 16×2 LCD for the intended hardware interface
 
-## Working
+## Simulate
 
-The user interacts with the system through a keypad to enter a PIN. The system verifies the PIN and, upon successful authentication, allows the user to select a transaction type. For deposits, the entered amount is added to the stored balance. For withdrawals, the system checks for sufficient balance before processing the transaction. All instructions and outputs are displayed on the LCD.
+Open the Verilog sources in Vivado or another Verilog simulator. Add `atm_tb.v` as a simulation source/testbench and select it as the simulation top. Run behavioral simulation and inspect the waveform for authentication, menu transitions, and transaction outcomes.
 
-## Simulation
+A generic Icarus Verilog compile/run command, if installed:
 
-Simulation verifies correct FSM transitions, PIN validation, and transaction handling. Testbenches are used to validate different operational scenarios including invalid PIN attempts and insufficient balance conditions.
+```bash
+iverilog -g2012 -s atm_tb -o atm_sim atm_tb.v atm_top.v atm_controller.v account_manager.v keypad_interface.v debounce.v lcd_driver.v
+vvp atm_sim
+```
 
-## Future Improvements
+## Synthesize for a board
 
-- Card-based authentication
-- Transaction history storage
-- Enhanced security mechanisms
-- Integration with external systems
+1. Add synthesizable modules to the Vivado project.
+2. Set `atm_top` as the synthesis top.
+3. Add a constraints file for the exact board pins and I/O standards.
+4. Confirm clock frequency, reset polarity, LCD timing, and keypad wiring.
+5. Run synthesis, implementation, and timing checks before programming the board.
+
+The repository does not include a board-independent pin assignment file. Do not reuse constraints from another FPGA model without checking its pinout and I/O voltage.
